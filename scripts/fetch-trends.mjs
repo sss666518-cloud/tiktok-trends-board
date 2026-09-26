@@ -1,5 +1,6 @@
-// Daily job: pull TikTok trending hashtags via Apify, stay inside the free plan, write data/trends.json.
-// Env: APIFY_TOKEN (required), COUNTRY (default US), LIMIT (default 20), MAX_SPEND_RATIO (default 0.8),
+// Daily job: pull the US TikTok Explore feed via Apify (mu0i~tiktok-trending), stay inside the free plan,
+// derive trending videos / hashtags / sounds, and write data/trends.json.
+// Env: APIFY_TOKEN (required), LIMIT (videos per run, default 30), MAX_SPEND_RATIO (default 0.8),
 //      APIFY_BASE (default https://api.apify.com, overridable for tests)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -10,17 +11,21 @@ const OUT = path.join(DATA, 'trends.json');
 const HIST = path.join(DATA, 'history');
 const BASE = process.env.APIFY_BASE || 'https://api.apify.com';
 const TOKEN = process.env.APIFY_TOKEN || '';
-const COUNTRY = (process.env.COUNTRY || 'US').toUpperCase();
-const LIMIT = Math.min(Math.max(parseInt(process.env.LIMIT || '20', 10) || 20, 1), 50);
+const LIMIT = Math.min(Math.max(parseInt(process.env.LIMIT || '30', 10) || 30, 5), 60);
 const MAX_SPEND_RATIO = Number(process.env.MAX_SPEND_RATIO || '0.8');
-const ACTOR = 'clockworks~tiktok-trends-scraper';
-const PRICE_PER_RESULT = 0.0017;
+const ACTOR = 'mu0i~tiktok-trending';
+const PRICE_PER_RESULT = 0.003;
+const REGION = 'US';
 
-const FIT_WORDS = ['app', 'dev', 'code', 'coding', 'program', 'startup', 'founder', 'build', 'saas', 'ai', 'tech', 'product', 'design', 'productiv', 'business', 'entrepreneur', 'indie', 'software', 'career', 'study', 'learn', 'tips', 'hack', 'workflow', 'side', 'money', 'work'];
-const REUSE_WORDS = ['pov', 'tips', 'hack', 'howto', 'tutorial', 'dayinthelife', 'behindthescenes', 'fyp', 'storytime', 'learn', 'before', 'after', 'challenge'];
+const GENERIC = new Set(['fyp', 'foryou', 'foryoupage', 'fypシ', 'fypage', 'viral', 'goviral', 'viralvideo', 'trending', 'trend', 'tiktok', 'xyzbca', 'capcut', 'explore', 'explorepage', 'fy', 'f', 'parati', 'foru', 'blowthisup', 'fypviral', 'viraltiktok', 'fypp', 'foyou']);
+const FIT_WORDS = ['app', 'dev', 'code', 'coding', 'program', 'startup', 'founder', 'build', 'saas', 'ai', 'tech', 'product', 'design', 'productiv', 'business', 'entrepreneur', 'indie', 'software', 'career', 'study', 'learn', 'tips', 'hack', 'workflow', 'sidehustle', 'money', 'work', 'office', 'corporate', 'college'];
+const REUSE_WORDS = ['pov', 'tips', 'hack', 'howto', 'tutorial', 'dayinthelife', 'behindthescenes', 'storytime', 'learn', 'before', 'after', 'challenge', 'routine', 'grwm', 'fyp'];
 
 const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
 const today = () => new Date().toISOString().slice(0, 10);
+const clamp = (n, a, b) => Math.max(a, Math.min(b, Math.round(n)));
+const hits = (s, words) => words.filter(w => s.includes(w)).length;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function api(p, opts = {}) {
   const res = await fetch(BASE + p, { ...opts, headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', ...(opts.headers || {}) } });
@@ -33,86 +38,124 @@ async function checkBudget() {
   const { data } = await api('/v2/users/me/limits');
   const used = Number(data?.current?.monthlyUsageUsd ?? 0);
   const cap = Number(data?.limits?.maxMonthlyUsageUsd ?? 5);
-  const next = LIMIT * PRICE_PER_RESULT * 1.5;
-  if (used + next > cap * MAX_SPEND_RATIO) throw new Error(`本月 Apify 额度已用 $${used.toFixed(2)} / $${cap.toFixed(2)}，为避免超出免费额度，今天跳过抓取`);
+  if (used + LIMIT * PRICE_PER_RESULT * 1.5 > cap * MAX_SPEND_RATIO) throw new Error(`本月 Apify 额度已用 $${used.toFixed(2)} / $${cap.toFixed(2)}，为避免超出免费额度，今天跳过抓取`);
   return { used, cap };
 }
 
-const pick = (o, keys) => { for (const k of keys) { const v = k.split('.').reduce((a, x) => (a == null ? a : a[x]), o); if (v != null && v !== '') return v; } return undefined; };
+async function runActor() {
+  const { data: run } = await api(`/v2/acts/${ACTOR}/runs?waitForFinish=240&maxItems=${LIMIT}`, { method: 'POST', body: JSON.stringify({ maxVideos: LIMIT }) });
+  let r = run;
+  for (let i = 0; i < 30 && !['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT'].includes(r.status); i++) { await sleep(8000); r = (await api(`/v2/actor-runs/${run.id}`)).data; }
+  if (r.status !== 'SUCCEEDED') throw new Error(`Apify 运行未成功（${r.status}${r.statusMessage ? '：' + String(r.statusMessage).slice(0, 160) : ''}）`);
+  const rows = await api(`/v2/datasets/${r.defaultDatasetId}/items?clean=true&limit=${LIMIT}`);
+  if (!Array.isArray(rows) || !rows.length) throw new Error('Apify 返回 0 条数据');
+  return rows;
+}
 
-function mapItem(raw, i, prevRanks) {
-  const name = String(pick(raw, ['name', 'hashtagName', 'hashtag_name', 'hashtag', 'title']) || '').replace(/^#/, '').trim();
-  if (!name) return null;
-  const rank = Number(pick(raw, ['rank', 'position'])) || i + 1;
-  const views = Number(pick(raw, ['videoViews', 'video_views', 'views', 'viewCount'])) || 0;
-  const posts = Number(pick(raw, ['publishCount', 'publishCnt', 'publish_cnt', 'videoCount', 'posts'])) || 0;
-  const curve = pick(raw, ['trend', 'trendingHistogram', 'trendCurve']);
-  const lower = name.toLowerCase();
+const tagsOf = v => (Array.isArray(v.hashtags) && v.hashtags.length ? v.hashtags : String(v.description || '').match(/#[^\s#]+/g) || [])
+  .map(t => String(typeof t === 'object' ? (t.name || t.title || '') : t).replace(/^#/, '').trim().toLowerCase()).filter(Boolean);
+const engagement = v => { const p = Number(v.playCount) || 0; return p ? ((Number(v.likeCount) || 0) + (Number(v.commentCount) || 0) + (Number(v.shareCount) || 0) + (Number(v.saveCount) || 0)) / p : 0; };
+const isOriginal = t => /original sound|原声|som original|sonido original/i.test(t || '');
 
-  let growth = 0;
-  if (Array.isArray(curve) && curve.length >= 2) {
-    const val = p => Number(typeof p === 'object' ? (p.value ?? p.y) : p) || 0;
-    const a = val(curve[0]), b = val(curve[curve.length - 1]);
-    growth = a > 0 ? Math.round(((b - a) / a) * 100) : (b > 0 ? 100 : 0);
-  }
-  const prev = prevRanks.get(lower);
-  const moved = prev ? prev - rank : 0;
-  const status = !prev ? (prevRanks.size && rank <= 5 ? 'Breakout' : 'New') : moved >= 3 ? 'Rising' : moved <= -3 ? 'Cooling' : 'Stable';
+function scoreText(text) {
+  const s = text.toLowerCase();
+  const fit = clamp(30 + hits(s, FIT_WORDS) * 25, 0, 95);
+  const reuse = clamp(50 + hits(s, REUSE_WORDS) * 12 + hits(s, FIT_WORDS) * 8, 0, 95);
+  return { fit, reuse };
+}
+const categoryOf = (fit, viral) => (fit >= 55 && viral >= 70 ? 'Bridge' : fit >= 55 ? 'Brand' : 'Traffic');
 
-  const fitHits = FIT_WORDS.filter(w => lower.includes(w)).length;
-  const viral = Math.max(40, Math.min(99, 100 - Math.round((rank - 1) * (55 / LIMIT)) + (status === 'Rising' || status === 'Breakout' ? 5 : 0)));
-  const fit = Math.min(95, 30 + fitHits * 25);
-  const reuse = Math.min(95, 50 + REUSE_WORDS.filter(w => lower.includes(w)).length * 15 + fitHits * 10);
-  const category = fit >= 55 && viral >= 70 ? 'Bridge' : fit >= 55 ? 'Brand' : 'Traffic';
-
-  return {
-    id: `tt-${COUNTRY}-${lower}`,
-    title: `#${name}`,
-    type: 'Hashtag',
-    category,
-    region: COUNTRY,
-    language: 'EN',
-    status,
-    growth,
-    volume: views || posts,
-    viral, fit, reuse,
-    source: 'TikTok Creative Center (Apify)',
-    url: pick(raw, ['url', 'link']) || `https://www.tiktok.com/tag/${encodeURIComponent(name)}`,
-    captured: new Date().toISOString(),
-    angle: `美国近 7 天热门话题第 ${rank} 名${posts ? `，${posts.toLocaleString('en-US')} 条帖子` : ''}${prev ? `，昨日第 ${prev} 名` : ''}。`,
-    shots: []
+function build(rows, prev) {
+  const now = new Date().toISOString();
+  const prevById = new Map((prev?.items || []).map(i => [i.id, i]));
+  const statusFor = (id, rank, prevRank) => {
+    if (!prevById.size) return 'New';
+    const p = prevById.get(id);
+    if (!p) return rank <= 3 ? 'Breakout' : 'New';
+    if (prevRank && prevRank - rank >= 2) return 'Rising';
+    if (prevRank && rank - prevRank >= 2) return 'Cooling';
+    return 'Stable';
   };
+  const maxPlay = Math.max(1, ...rows.map(v => Number(v.playCount) || 0));
+
+  const videos = rows
+    .filter(v => v.url)
+    .sort((a, b) => (Number(b.playCount) || 0) - (Number(a.playCount) || 0))
+    .map((v, i) => {
+      const id = `vid-${v.videoId || i}`;
+      const plays = Number(v.playCount) || 0;
+      const hours = Math.max(1, (Date.now() - new Date(v.createdAt).getTime()) / 36e5) || 1;
+      const p = prevById.get(id);
+      const growth = p && p.volume ? Math.round(((plays - p.volume) / p.volume) * 100) : 0;
+      const tags = tagsOf(v).filter(t => !GENERIC.has(t));
+      const desc = String(v.description || '').replace(/\s+/g, ' ').trim();
+      const viral = clamp(40 + (plays / maxPlay) * 40 + Math.min(engagement(v), 0.25) * 80, 0, 99);
+      const { fit, reuse } = scoreText(`${desc} ${tags.join(' ')}`);
+      return {
+        id, title: desc ? desc.slice(0, 90) : `@${v.authorUsername} 的视频`, type: v.isPhotoPost ? 'Template' : 'Topic',
+        category: categoryOf(fit, viral), region: REGION, language: 'EN',
+        status: statusFor(id, i + 1, p ? (prev.items.filter(x => x.id.startsWith('vid-')).findIndex(x => x.id === id) + 1) : 0),
+        growth, volume: plays, viral, fit, reuse,
+        source: 'TikTok Explore (Apify)', url: v.url, captured: v.collectedAt || now,
+        hook: desc.slice(0, 200),
+        angle: `@${v.authorUsername || '?'} · ${v.isPhotoPost ? '图文' : `${Math.round((Number(v.durationMs) || 0) / 1000)} 秒视频`} · 发布 ${Math.round(hours)} 小时 · 约 ${Math.round(plays / hours).toLocaleString('en-US')} 播放/小时 · 互动率 ${(engagement(v) * 100).toFixed(1)}%${v.musicTitle ? ` · 音乐：${v.musicTitle}` : ''}`,
+        shots: []
+      };
+    });
+
+  const agg = (keyFn, labelFn) => {
+    const m = new Map();
+    for (const v of rows) for (const k of keyFn(v)) {
+      const e = m.get(k) || { k, n: 0, plays: 0, sample: v, label: labelFn(v, k) };
+      e.n++; e.plays += Number(v.playCount) || 0; m.set(k, e);
+    }
+    return [...m.values()].filter(e => e.n >= 2).sort((a, b) => b.n - a.n || b.plays - a.plays);
+  };
+
+  const hashtags = agg(v => [...new Set(tagsOf(v).filter(t => !GENERIC.has(t)))], (v, k) => `#${k}`).slice(0, 15).map((e, i) => {
+    const id = `tag-${e.k}`, p = prevById.get(id);
+    const viral = clamp(45 + e.n * 8 + (e.plays / maxPlay) * 20, 0, 99);
+    const { fit, reuse } = scoreText(e.k);
+    return {
+      id, title: e.label, type: 'Hashtag', category: categoryOf(fit, viral), region: REGION, language: 'EN',
+      status: statusFor(id, i + 1, 0), growth: p && p.volume ? Math.round(((e.plays - p.volume) / p.volume) * 100) : 0,
+      volume: e.plays, viral, fit, reuse, source: 'TikTok Explore (Apify)',
+      url: `https://www.tiktok.com/tag/${encodeURIComponent(e.k)}`, captured: now,
+      angle: `今日抽样的 ${rows.length} 条 Explore 热门内容中，有 ${e.n} 条使用此标签，合计 ${e.plays.toLocaleString('en-US')} 播放。`, shots: []
+    };
+  });
+
+  const sounds = agg(v => (v.musicId && !isOriginal(v.musicTitle) ? [String(v.musicId)] : []), v => `${v.musicTitle || 'Unknown'}${v.musicAuthor ? ' — ' + v.musicAuthor : ''}`).slice(0, 10).map((e, i) => {
+    const id = `music-${e.k}`, p = prevById.get(id);
+    const viral = clamp(50 + e.n * 8 + (e.plays / maxPlay) * 20, 0, 99);
+    return {
+      id, title: e.label.slice(0, 120), type: 'Music', category: 'Traffic', region: REGION, language: 'EN',
+      status: statusFor(id, i + 1, 0), growth: p && p.volume ? Math.round(((e.plays - p.volume) / p.volume) * 100) : 0,
+      volume: e.plays, viral, fit: 40, reuse: 70, source: 'TikTok Explore (Apify)',
+      url: `https://www.tiktok.com/music/x-${encodeURIComponent(e.k)}`, captured: now,
+      angle: `今日抽样中有 ${e.n} 条热门内容使用这段音乐，合计 ${e.plays.toLocaleString('en-US')} 播放。发布时在平台音乐库内添加。`, shots: []
+    };
+  });
+
+  return [...hashtags, ...sounds, ...videos];
 }
 
 async function main() {
   fs.mkdirSync(HIST, { recursive: true });
   const prevFile = readJson(OUT, null);
-  const prevRanks = new Map();
-  (prevFile?.items || []).forEach((it, i) => prevRanks.set(String(it.title).replace(/^#/, '').toLowerCase(), i + 1));
-
-  const base = { region: COUNTRY, source: 'TikTok Creative Center via Apify', note: '评分为内部规则计算，不是 TikTok 官方数据' };
+  const base = { region: REGION, source: 'TikTok Explore feed via Apify (mu0i/tiktok-trending)', note: '评分为内部规则计算，不是 TikTok 官方数据；话题与音乐由当日抽样的热门视频统计得出' };
   try {
     if (!TOKEN) throw new Error('缺少 APIFY_TOKEN');
     const budget = await checkBudget();
-    const input = {
-      adsScrapeHashtags: true, adsScrapeSounds: false, adsScrapeCreators: false, adsScrapeVideos: false,
-      adsCountryCode: COUNTRY, adsTimeRange: '7', resultsPerPage: LIMIT
-    };
-    const { data: run } = await api(`/v2/acts/${ACTOR}/runs?waitForFinish=240&maxItems=${LIMIT}`, { method: 'POST', body: JSON.stringify(input) });
-    const rows = run?.defaultDatasetId ? await api(`/v2/datasets/${run.defaultDatasetId}/items?clean=true&limit=${LIMIT}`) : [];
-    if (!Array.isArray(rows) || !rows.length) {
-      let tail = '';
-      try { const r = await fetch(`${BASE}/v2/logs/${run.id}`, { headers: { Authorization: `Bearer ${TOKEN}` } }); tail = (await r.text()).trim().split('\n').slice(-15).join('\n'); } catch {}
-      console.log(`Apify run ${run?.id} status=${run?.status} message=${run?.statusMessage || ''}\n--- actor log tail ---\n${tail}`);
-      throw new Error(`Apify 返回 0 条数据（运行状态：${run?.status || '未知'}${run?.statusMessage ? '，' + String(run.statusMessage).slice(0, 160) : ''}）`);
-    }
+    const rows = await runActor();
     fs.writeFileSync(path.join(DATA, 'raw-latest.json'), JSON.stringify(rows.slice(0, 3), null, 2));
-    const items = rows.slice(0, LIMIT).map((r, i) => mapItem(r, i, prevRanks)).filter(Boolean);
+    const items = build(rows, prevFile?.status === 'ok' ? prevFile : (prevFile?.items?.length ? prevFile : null));
     if (!items.length) throw new Error('数据字段无法识别，请查看 data/raw-latest.json');
-    const out = { ...base, status: 'ok', generatedAt: new Date().toISOString(), error: null, budget: { usedUsd: budget.used, capUsd: budget.cap }, items };
+    const out = { ...base, status: 'ok', generatedAt: new Date().toISOString(), error: null, sampleSize: rows.length, budget: { usedUsd: budget.used, capUsd: budget.cap }, items };
     fs.writeFileSync(OUT, JSON.stringify(out, null, 2));
     fs.writeFileSync(path.join(HIST, `${today()}.json`), JSON.stringify(out, null, 2));
-    console.log(`OK: ${items.length} hashtags for ${COUNTRY}; month usage $${budget.used.toFixed(2)}/$${budget.cap.toFixed(2)}`);
+    const count = t => items.filter(i => i.type === t).length;
+    console.log(`OK: ${rows.length} videos → ${count('Hashtag')} hashtags, ${count('Music')} sounds, ${items.length - count('Hashtag') - count('Music')} videos; month usage $${budget.used.toFixed(2)}/$${budget.cap.toFixed(2)}`);
   } catch (e) {
     const kept = prevFile?.items || [];
     const out = { ...base, status: 'error', generatedAt: prevFile?.generatedAt || null, error: { message: e.message, at: new Date().toISOString() }, items: kept };

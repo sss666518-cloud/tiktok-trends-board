@@ -24,8 +24,7 @@ jobs:
       - name: Fetch trends
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-          COUNTRY: US
-          LIMIT: '20'
+          LIMIT: '30'
         run: node scripts/fetch-trends.mjs
       - name: Commit data
         run: |
