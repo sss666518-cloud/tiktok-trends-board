@@ -1,0 +1,8 @@
+{
+  "region": "US",
+  "source": "TikTok Creative Center via Apify",
+  "status": "error",
+  "generatedAt": null,
+  "error": { "message": "尚未运行首次抓取。请在 GitHub 仓库的 Actions 页面手动运行一次 Update TikTok trends。", "at": "2026-09-26T00:00:00Z" },
+  "items": []
+}
