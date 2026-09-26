@@ -98,8 +98,14 @@ async function main() {
       adsScrapeHashtags: true, adsScrapeSounds: false, adsScrapeCreators: false, adsScrapeVideos: false,
       adsCountryCode: COUNTRY, adsTimeRange: '7', resultsPerPage: LIMIT
     };
-    const rows = await api(`/v2/acts/${ACTOR}/run-sync-get-dataset-items?timeout=240&maxItems=${LIMIT}`, { method: 'POST', body: JSON.stringify(input) });
-    if (!Array.isArray(rows) || !rows.length) throw new Error('Apify 返回 0 条数据');
+    const { data: run } = await api(`/v2/acts/${ACTOR}/runs?waitForFinish=240&maxItems=${LIMIT}`, { method: 'POST', body: JSON.stringify(input) });
+    const rows = run?.defaultDatasetId ? await api(`/v2/datasets/${run.defaultDatasetId}/items?clean=true&limit=${LIMIT}`) : [];
+    if (!Array.isArray(rows) || !rows.length) {
+      let tail = '';
+      try { const r = await fetch(`${BASE}/v2/logs/${run.id}`, { headers: { Authorization: `Bearer ${TOKEN}` } }); tail = (await r.text()).trim().split('\n').slice(-15).join('\n'); } catch {}
+      console.log(`Apify run ${run?.id} status=${run?.status} message=${run?.statusMessage || ''}\n--- actor log tail ---\n${tail}`);
+      throw new Error(`Apify 返回 0 条数据（运行状态：${run?.status || '未知'}${run?.statusMessage ? '，' + String(run.statusMessage).slice(0, 160) : ''}）`);
+    }
     fs.writeFileSync(path.join(DATA, 'raw-latest.json'), JSON.stringify(rows.slice(0, 3), null, 2));
     const items = rows.slice(0, LIMIT).map((r, i) => mapItem(r, i, prevRanks)).filter(Boolean);
     if (!items.length) throw new Error('数据字段无法识别，请查看 data/raw-latest.json');
