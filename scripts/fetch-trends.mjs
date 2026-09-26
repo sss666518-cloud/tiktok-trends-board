@@ -24,7 +24,10 @@ const REUSE_WORDS = ['pov', 'tips', 'hack', 'howto', 'tutorial', 'dayinthelife',
 const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
 const today = () => new Date().toISOString().slice(0, 10);
 const clamp = (n, a, b) => Math.max(a, Math.min(b, Math.round(n)));
-const hits = (s, words) => words.filter(w => s.includes(w)).length;
+const tokens = s => s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+// short words must match a whole token; longer stems may prefix a token (e.g. coding → codinglife)
+const hits = (s, words) => { const t = tokens(s); return words.filter(w => t.some(x => x === w || (w.length >= 5 && x.startsWith(w)))).length; };
+const WINDOW_DAYS = 7;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function api(p, opts = {}) {
@@ -58,14 +61,14 @@ const engagement = v => { const p = Number(v.playCount) || 0; return p ? ((Numbe
 const isOriginal = t => /original sound|原声|som original|sonido original/i.test(t || '');
 
 function scoreText(text) {
-  const s = text.toLowerCase();
+  const s = text;
   const fit = clamp(30 + hits(s, FIT_WORDS) * 25, 0, 95);
   const reuse = clamp(50 + hits(s, REUSE_WORDS) * 12 + hits(s, FIT_WORDS) * 8, 0, 95);
   return { fit, reuse };
 }
 const categoryOf = (fit, viral) => (fit >= 55 && viral >= 70 ? 'Bridge' : fit >= 55 ? 'Brand' : 'Traffic');
 
-function build(rows, prev) {
+function build(rows, prev, past = []) {
   const now = new Date().toISOString();
   const prevById = new Map((prev?.items || []).map(i => [i.id, i]));
   const statusFor = (id, rank, prevRank) => {
@@ -103,9 +106,12 @@ function build(rows, prev) {
       };
     });
 
+  const seen = new Set(rows.map(v => String(v.videoId)));
+  const pool = [...rows, ...past.filter(v => v && !seen.has(String(v.videoId)) && seen.add(String(v.videoId)))];
+  const days = 1 + new Set(past.map(v => v._day)).size;
   const agg = (keyFn, labelFn) => {
     const m = new Map();
-    for (const v of rows) for (const k of keyFn(v)) {
+    for (const v of pool) for (const k of keyFn(v)) {
       const e = m.get(k) || { k, n: 0, plays: 0, sample: v, label: labelFn(v, k) };
       e.n++; e.plays += Number(v.playCount) || 0; m.set(k, e);
     }
@@ -121,7 +127,7 @@ function build(rows, prev) {
       status: statusFor(id, i + 1, 0), growth: p && p.volume ? Math.round(((e.plays - p.volume) / p.volume) * 100) : 0,
       volume: e.plays, viral, fit, reuse, source: 'TikTok Explore (Apify)',
       url: `https://www.tiktok.com/tag/${encodeURIComponent(e.k)}`, captured: now,
-      angle: `今日抽样的 ${rows.length} 条 Explore 热门内容中，有 ${e.n} 条使用此标签，合计 ${e.plays.toLocaleString('en-US')} 播放。`, shots: []
+      angle: `最近 ${days} 天抽样的 ${pool.length} 条 Explore 热门内容中，有 ${e.n} 条使用此标签，合计 ${e.plays.toLocaleString('en-US')} 播放。`, shots: []
     };
   });
 
@@ -133,7 +139,7 @@ function build(rows, prev) {
       status: statusFor(id, i + 1, 0), growth: p && p.volume ? Math.round(((e.plays - p.volume) / p.volume) * 100) : 0,
       volume: e.plays, viral, fit: 40, reuse: 70, source: 'TikTok Explore (Apify)',
       url: `https://www.tiktok.com/music/x-${encodeURIComponent(e.k)}`, captured: now,
-      angle: `今日抽样中有 ${e.n} 条热门内容使用这段音乐，合计 ${e.plays.toLocaleString('en-US')} 播放。发布时在平台音乐库内添加。`, shots: []
+      angle: `最近 ${days} 天抽样中有 ${e.n} 条热门内容使用这段音乐，合计 ${e.plays.toLocaleString('en-US')} 播放。发布时在平台音乐库内添加。`, shots: []
     };
   });
 
@@ -149,11 +155,18 @@ async function main() {
     const budget = await checkBudget();
     const rows = await runActor();
     fs.writeFileSync(path.join(DATA, 'raw-latest.json'), JSON.stringify(rows.slice(0, 3), null, 2));
-    const items = build(rows, prevFile?.status === 'ok' ? prevFile : (prevFile?.items?.length ? prevFile : null));
+    const past = [];
+    for (let d = 1; d < WINDOW_DAYS; d++) {
+      const day = new Date(Date.now() - d * 864e5).toISOString().slice(0, 10);
+      const h = readJson(path.join(HIST, `${day}.json`), null);
+      if (Array.isArray(h?.sample)) h.sample.forEach(v => past.push({ ...v, _day: day }));
+    }
+    const items = build(rows, prevFile?.items?.length ? prevFile : null, past);
+    const sample = rows.map(v => ({ videoId: String(v.videoId), playCount: Number(v.playCount) || 0, hashtags: tagsOf(v), musicId: v.musicId || null, musicTitle: v.musicTitle || '', musicAuthor: v.musicAuthor || '' }));
     if (!items.length) throw new Error('数据字段无法识别，请查看 data/raw-latest.json');
     const out = { ...base, status: 'ok', generatedAt: new Date().toISOString(), error: null, sampleSize: rows.length, budget: { usedUsd: budget.used, capUsd: budget.cap }, items };
     fs.writeFileSync(OUT, JSON.stringify(out, null, 2));
-    fs.writeFileSync(path.join(HIST, `${today()}.json`), JSON.stringify(out, null, 2));
+    fs.writeFileSync(path.join(HIST, `${today()}.json`), JSON.stringify({ ...out, sample }, null, 2));
     const count = t => items.filter(i => i.type === t).length;
     console.log(`OK: ${rows.length} videos → ${count('Hashtag')} hashtags, ${count('Music')} sounds, ${items.length - count('Hashtag') - count('Music')} videos; month usage $${budget.used.toFixed(2)}/$${budget.cap.toFixed(2)}`);
   } catch (e) {
