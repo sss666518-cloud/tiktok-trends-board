@@ -1,8 +1,12 @@
 {
   "region": "US",
   "source": "TikTok Creative Center via Apify",
+  "note": "评分为内部规则计算，不是 TikTok 官方数据",
   "status": "error",
   "generatedAt": null,
-  "error": { "message": "尚未运行首次抓取。请在 GitHub 仓库的 Actions 页面手动运行一次 Update TikTok trends。", "at": "2026-09-26T00:00:00Z" },
+  "error": {
+    "message": "Apify 返回 0 条数据",
+    "at": "2026-09-26T06:57:21.004Z"
+  },
   "items": []
 }
