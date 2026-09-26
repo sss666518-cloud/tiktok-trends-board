@@ -157,7 +157,7 @@ async function main() {
     const rows = await runActor();
     fs.writeFileSync(path.join(DATA, 'raw-latest.json'), JSON.stringify(rows.slice(0, 3), null, 2));
     const past = [];
-    for (let d = 1; d < WINDOW_DAYS; d++) {
+    for (let d = 0; d < WINDOW_DAYS; d++) {
       const day = new Date(Date.now() - d * 864e5).toISOString().slice(0, 10);
       const h = readJson(path.join(HIST, `${day}.json`), null);
       if (Array.isArray(h?.sample)) h.sample.forEach(v => past.push({ ...v, _day: day }));
