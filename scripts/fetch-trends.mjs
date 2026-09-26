@@ -18,6 +18,7 @@ const PRICE_PER_RESULT = 0.003;
 const REGION = 'US';
 
 const GENERIC = new Set(['fyp', 'foryou', 'foryoupage', 'fypシ', 'fypage', 'viral', 'goviral', 'viralvideo', 'trending', 'trend', 'tiktok', 'xyzbca', 'capcut', 'explore', 'explorepage', 'fy', 'f', 'parati', 'foru', 'blowthisup', 'fypviral', 'viraltiktok', 'fypp', 'foyou']);
+const isGeneric = t => GENERIC.has(t) || /^(fy+p*|foryou|for+you|parati|paratí|viral|trending|explore)/.test(t) || /(.)\1{3,}/.test(t) || t.length < 2;
 const FIT_WORDS = ['app', 'dev', 'code', 'coding', 'program', 'startup', 'founder', 'build', 'saas', 'ai', 'tech', 'product', 'design', 'productiv', 'business', 'entrepreneur', 'indie', 'software', 'career', 'study', 'learn', 'tips', 'hack', 'workflow', 'sidehustle', 'money', 'work', 'office', 'corporate', 'college'];
 const REUSE_WORDS = ['pov', 'tips', 'hack', 'howto', 'tutorial', 'dayinthelife', 'behindthescenes', 'storytime', 'learn', 'before', 'after', 'challenge', 'routine', 'grwm', 'fyp'];
 
@@ -90,7 +91,7 @@ function build(rows, prev, past = []) {
       const hours = Math.max(1, (Date.now() - new Date(v.createdAt).getTime()) / 36e5) || 1;
       const p = prevById.get(id);
       const growth = p && p.volume ? Math.round(((plays - p.volume) / p.volume) * 100) : 0;
-      const tags = tagsOf(v).filter(t => !GENERIC.has(t));
+      const tags = tagsOf(v).filter(t => !isGeneric(t));
       const desc = String(v.description || '').replace(/\s+/g, ' ').trim();
       const viral = clamp(40 + (plays / maxPlay) * 40 + Math.min(engagement(v), 0.25) * 80, 0, 99);
       const { fit, reuse } = scoreText(`${desc} ${tags.join(' ')}`);
@@ -118,7 +119,7 @@ function build(rows, prev, past = []) {
     return [...m.values()].filter(e => e.n >= 2).sort((a, b) => b.n - a.n || b.plays - a.plays);
   };
 
-  const hashtags = agg(v => [...new Set(tagsOf(v).filter(t => !GENERIC.has(t)))], (v, k) => `#${k}`).slice(0, 15).map((e, i) => {
+  const hashtags = agg(v => [...new Set(tagsOf(v).filter(t => !isGeneric(t)))], (v, k) => `#${k}`).slice(0, 15).map((e, i) => {
     const id = `tag-${e.k}`, p = prevById.get(id);
     const viral = clamp(45 + e.n * 8 + (e.plays / maxPlay) * 20, 0, 99);
     const { fit, reuse } = scoreText(e.k);
